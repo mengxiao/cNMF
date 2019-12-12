@@ -88,7 +88,7 @@ def get_highvar_genes_sparse(expression, expected_fano_threshold=None,
     # Find parameters for expected fano line
     top_genes = gene_mean.sort_values(ascending=False)[:20].index
     A = (np.sqrt(gene_var)/gene_mean)[top_genes].min()
-    
+
     w_mean_low, w_mean_high = gene_mean.quantile([0.10, 0.90])
     w_fano_low, w_fano_high = gene_fano.quantile([0.10, 0.90])
     winsor_box = ((gene_fano > w_fano_low) &
@@ -268,7 +268,7 @@ class cNMF():
         counts : anndata.AnnData
             Scanpy AnnData object (cells x genes) containing raw counts. Filtered such that
             no genes or cells with 0 counts
-        
+
         tpm : anndata.AnnData
             Scanpy AnnData object (cells x genes) containing tpm normalized data matching
             counts
@@ -296,12 +296,12 @@ class cNMF():
         if high_variance_genes_filter is None:
             ## Get list of high-var genes if one wasn't provided
             if sp.issparse(tpm.X):
-                (gene_counts_stats, gene_fano_params) = get_highvar_genes_sparse(tpm.X, numgenes=num_highvar_genes)  
+                (gene_counts_stats, gene_fano_params) = get_highvar_genes_sparse(tpm.X, numgenes=num_highvar_genes)
             else:
                 (gene_counts_stats, gene_fano_params) = get_highvar_genes(np.array(tpm.X), numgenes=num_highvar_genes)
-                
+
             high_variance_genes_filter = list(tpm.var.index[gene_counts_stats.high_var.values])
-                
+
         ## Subset out high-variance genes
         norm_counts = counts[:, high_variance_genes_filter]
 
@@ -309,12 +309,12 @@ class cNMF():
         if sp.issparse(tpm.X):
             sc.pp.scale(norm_counts, zero_center=False)
             if np.isnan(norm_counts.X.data).sum() > 0:
-                print('Warning NaNs in normalized counts matrix')                       
+                print('Warning NaNs in normalized counts matrix')
         else:
             norm_counts.X /= norm_counts.X.std(axis=0, ddof=1)
             if np.isnan(norm_counts.X).sum().sum() > 0:
-                print('Warning NaNs in normalized counts matrix')                    
-                    
+                print('Warning NaNs in normalized counts matrix')
+
         ## Save a \n-delimited list of the high-variance genes used for factorization
         open(self.paths['nmf_genes_list'], 'w').write('\n'.join(high_variance_genes_filter))
 
@@ -324,18 +324,19 @@ class cNMF():
             examples = norm_counts.obs.index[zerocells]
             print('Warning: %d cells have zero counts of overdispersed genes. E.g. %s' % (zerocells.sum(), examples[0]))
             print('Consensus step may not run when this is the case')
-        
+
         return(norm_counts)
 
-    
+
     def save_norm_counts(self, norm_counts):
         self._initialize_dirs()
         sc.write(self.paths['normalized_counts'], norm_counts)
 
-        
+
     def get_nmf_iter_params(self, ks, n_iter = 100,
                                random_state_seed = None,
-                               beta_loss = 'kullback-leibler'):
+                               beta_loss = 'kullback-leibler',
+                               cell_sampling_fraction = 1):
         """
         Create a DataFrame with parameters for NMF iterations.
 
@@ -352,6 +353,9 @@ class cNMF():
 
         random_state_seed : int or None, optional (default=None)
             Seed for sklearn random state.
+
+        cell_sampling_fraction: float or None, optional (default=1)
+            Fraction of cells to include in each replicate.
 
         """
 
@@ -379,9 +383,10 @@ class cNMF():
                         tol=1e-4,
                         max_iter=400,
                         regularization=None,
-                        init='random'
+                        init='random',
+                        cell_sampling_fraction=cell_sampling_fraction
                         )
-        
+
         ## Coordinate descent is faster than multiplicative update but only works for frobenius
         if beta_loss == 'frobenius':
             _nmf_kwargs['solver'] = 'cd'
@@ -407,6 +412,10 @@ class cNMF():
             Arguments to be passed to ``non_negative_factorization``
 
         """
+        # remove parameter not used by non_negative_factorization
+        if 'cell_sampling_fraction' in nmf_kwargs:
+            del nmf_kwargs['cell_sampling_fraction']
+
         (usages, spectra, niter) = non_negative_factorization(X, **nmf_kwargs)
 
         return(spectra, usages)
@@ -449,6 +458,7 @@ class cNMF():
         run_params = load_df_from_npz(self.paths['nmf_replicate_parameters'])
         norm_counts = sc.read(self.paths['normalized_counts'])
         _nmf_kwargs = yaml.load(open(self.paths['nmf_run_parameters']), Loader=yaml.FullLoader)
+        cell_sampling_fraction = _nmf_kwargs['cell_sampling_fraction']
 
         jobs_for_this_worker = worker_filter(range(len(run_params)), worker_i, total_workers)
         for idx in jobs_for_this_worker:
@@ -458,7 +468,16 @@ class cNMF():
             _nmf_kwargs['random_state'] = p['nmf_seed']
             _nmf_kwargs['n_components'] = p['n_components']
 
-            (spectra, usages) = self._nmf(norm_counts.X, _nmf_kwargs)
+            if cell_sampling_fraction == 1:
+                data = norm_counts.X
+            else:
+                cell_count = norm_counts.X.shape[0]
+                sample_size = int(cell_count * cell_sampling_fraction)
+                np.random.seed(seed=p['nmf_seed'])
+                sampled_cells = np.random.choice(cell_count, sample_size, replace=False)
+                data = norm_counts.X[sampled_cells, :]
+
+            (spectra, _) = self._nmf(data, _nmf_kwargs)
             spectra = pd.DataFrame(spectra,
                                    index=np.arange(1, _nmf_kwargs['n_components']+1),
                                    columns=norm_counts.var.index)
@@ -551,7 +570,7 @@ class cNMF():
                                     H = median_spectra.values,
                                     update_H = False
                                     ))
-        
+
         _, rf_usages = self._nmf(norm_counts.X,
                                           nmf_kwargs=refit_nmf_kwargs)
         rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=median_spectra.index)
@@ -562,14 +581,14 @@ class cNMF():
             prediction_error = ((norm_counts.X.todense() - rf_pred_norm_counts)**2).sum().sum()
         else:
             prediction_error = ((norm_counts.X - rf_pred_norm_counts)**2).sum().sum()
-        
+
         consensus_stats = pd.DataFrame([k, density_threshold, stability, prediction_error],
                     index = ['k', 'local_density_threshold', 'stability', 'prediction_error'],
                     columns = ['stats'])
 
         if skip_density_and_return_after_stats:
             return consensus_stats
-        
+
         save_df_to_npz(median_spectra, self.paths['consensus_spectra']%(k, density_threshold_repl))
         save_df_to_npz(rf_usages, self.paths['consensus_usages']%(k, density_threshold_repl))
         save_df_to_npz(consensus_stats, self.paths['consensus_stats']%(k, density_threshold_repl))
@@ -579,12 +598,12 @@ class cNMF():
         # Compute gene-scores for each GEP by regressing usage on Z-scores of TPM
         tpm = sc.read(self.paths['tpm'])
         tpm_stats = load_df_from_npz(self.paths['tpm_stats'])
-        
+
         if sp.issparse(tpm.X):
             norm_tpm = (np.array(tpm.X.todense()) - tpm_stats['__mean'].values) / tpm_stats['__std'].values
         else:
             norm_tpm = (tpm.X - tpm_stats['__mean'].values) / tpm_stats['__std'].values
-            
+
         usage_coef = fast_ols_all_cols(rf_usages.values, norm_tpm)
         usage_coef = pd.DataFrame(usage_coef, index=rf_usages.columns, columns=tpm.var.index)
 
@@ -597,7 +616,7 @@ class cNMF():
         refit_nmf_kwargs.update(dict(
                                     H = norm_usages.T.values,
                                 ))
-        
+
         _, spectra_tpm = self._nmf(tpm.X.T, nmf_kwargs=refit_nmf_kwargs)
         spectra_tpm = pd.DataFrame(spectra_tpm.T, index=rf_usages.columns, columns=tpm.var.index)
         save_df_to_npz(spectra_tpm, self.paths['gene_spectra_tpm']%(k, density_threshold_repl))
@@ -758,6 +777,7 @@ if __name__=="__main__":
     parser.add_argument('-c', '--counts', type=str, help='[prepare] Input (cell x gene) counts matrix as df.npz or tab delimited text file')
     parser.add_argument('-k', '--components', type=int, help='[prepare] Numper of components (k) for matrix factorization. Several can be specified with "-k 8 9 10"', nargs='+')
     parser.add_argument('-n', '--n-iter', type=int, help='[prepare] Numper of factorization replicates', default=100)
+    parser.add_argument('--cell-sampling-fraction', type=float, help='[prepare] Fraction of cells to include in each replicate', default=1)
     parser.add_argument('--total-workers', type=int, help='[all] Total number of workers to distribute jobs to', default=1)
     parser.add_argument('--seed', type=int, help='[prepare] Seed for pseudorandom number generation', default=None)
     parser.add_argument('--genes-file', type=str, help='[prepare] File containing a list of genes to include, one gene per line. Must match column labels of counts matrix.', default=None)
@@ -766,9 +786,9 @@ if __name__=="__main__":
     parser.add_argument('--beta-loss', type=str, choices=['frobenius', 'kullback-leibler', 'itakura-saito'], help='[prepare] Loss function for NMF.', default='frobenius')
     parser.add_argument('--densify', dest='densify', help='[prepare] Treat the input data as non-sparse', action='store_true', default=False)
 
-    
+
     parser.add_argument('--worker-index', type=int, help='[factorize] Index of current worker (the first worker should have index 0)', default=0)
-    
+
     parser.add_argument('--local-density-threshold', type=str, help='[consensus] Threshold for the local density filtering. This string must convert to a float >0 and <=2', default='0.5')
     parser.add_argument('--local-neighborhood-size', type=float, help='[consensus] Fraction of the number of replicates to use as nearest neighbors for local density filtering', default=0.30)
     parser.add_argument('--show-clustering', dest='show_clustering', help='[consensus] Produce a clustergram figure summarizing the spectra clustering', action='store_true')
@@ -777,7 +797,7 @@ if __name__=="__main__":
 
     cnmf_obj = cNMF(output_dir=args.output_dir, name=args.name)
     cnmf_obj._initialize_dirs()
-    
+
     if args.command == 'prepare':
 
         if args.counts.endswith('.h5ad'):
@@ -788,7 +808,7 @@ if __name__=="__main__":
                 input_counts = load_df_from_npz(args.counts)
             else:
                 input_counts = pd.read_csv(args.counts, sep='\t', index_col=0)
-                
+
             if args.densify:
                 input_counts = sc.AnnData(X=input_counts.values,
                                        obs=pd.DataFrame(index=input_counts.index),
@@ -798,10 +818,10 @@ if __name__=="__main__":
                                        obs=pd.DataFrame(index=input_counts.index),
                                        var=pd.DataFrame(index=input_counts.columns))
 
-                
+
         if sp.issparse(input_counts.X) & args.densify:
             input_counts.X = np.array(input_counts.X.todense())
- 
+
         if args.tpm is None:
             tpm = compute_tpm(input_counts)
             sc.write(cnmf_obj.paths['tpm'], tpm)
@@ -813,30 +833,30 @@ if __name__=="__main__":
                 tpm = load_df_from_npz(args.tpm)
             else:
                 tpm = pd.read_csv(args.tpm, sep='\t', index_col=0)
-            
+
             if args.densify:
                 tpm = sc.AnnData(X=tpm.values,
                             obs=pd.DataFrame(index=tpm.index),
-                            var=pd.DataFrame(index=tpm.columns)) 
+                            var=pd.DataFrame(index=tpm.columns))
             else:
                 tpm = sc.AnnData(X=sp.csr_matrix(tpm.values),
                             obs=pd.DataFrame(index=tpm.index),
-                            var=pd.DataFrame(index=tpm.columns)) 
+                            var=pd.DataFrame(index=tpm.columns))
 
             sc.write(cnmf_obj.paths['tpm'], tpm)
-        
+
         if sp.issparse(tpm.X):
             gene_tpm_mean = np.array(tpm.X.mean(axis=0)).reshape(-1)
             gene_tpm_stddev = var_sparse_matrix(tpm.X)**.5
         else:
             gene_tpm_mean = np.array(tpm.X.mean(axis=0)).reshape(-1)
             gene_tpm_stddev = np.array(tpm.X.std(axis=0, ddof=0)).reshape(-1)
-            
-            
+
+
         input_tpm_stats = pd.DataFrame([gene_tpm_mean, gene_tpm_stddev],
              index = ['__mean', '__std']).T
         save_df_to_npz(input_tpm_stats, cnmf_obj.paths['tpm_stats'])
-        
+
         if args.genes_file is not None:
             highvargenes = open(args.genes_file).read().rstrip().split('\n')
         else:
@@ -845,7 +865,7 @@ if __name__=="__main__":
         norm_counts = cnmf_obj.get_norm_counts(input_counts, tpm, num_highvar_genes=args.numgenes,
                                                high_variance_genes_filter=highvargenes)
         cnmf_obj.save_norm_counts(norm_counts)
-        (replicate_params, run_params) = cnmf_obj.get_nmf_iter_params(ks=args.components, n_iter=args.n_iter, random_state_seed=args.seed, beta_loss=args.beta_loss)
+        (replicate_params, run_params) = cnmf_obj.get_nmf_iter_params(ks=args.components, n_iter=args.n_iter, random_state_seed=args.seed, beta_loss=args.beta_loss, cell_sampling_fraction=args.cell_sampling_fraction)
         cnmf_obj.save_nmf_iter_params(replicate_params, run_params)
 
 
